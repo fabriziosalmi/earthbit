@@ -30,8 +30,7 @@ services:
       - ROLE=worker
       - USE_DHCLIENT=0
       - MANAGER_HOST=127.0.0.1
-    networks:
-      - moon-net
+
     cap_add:
       - NET_ADMIN
 
