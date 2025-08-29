@@ -1,0 +1,35 @@
+version: '3.8'
+services:
+  manager:
+    build: ./manager
+    container_name: sun-manager
+    environment:
+      - ROLE=manager
+      - USE_DHCLIENT=0
+      - ELECTION_INTERVAL=10
+      - ELECTION_K=1
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+
+  worker1:
+    build: ./worker
+    container_name: moon-worker-1
+    environment:
+      - ROLE=worker
+      - USE_DHCLIENT=0
+      - MANAGER_HOST=127.0.0.1
+    cap_add:
+      - NET_ADMIN
+
+  worker2:
+    build: ./worker
+    container_name: moon-worker-2
+    environment:
+      - ROLE=worker
+      - USE_DHCLIENT=0
+      - MANAGER_HOST=127.0.0.1
+    cap_add:
+      - NET_ADMIN
+
+
