@@ -1,4 +1,9 @@
 version: '3.8'
+
+networks:
+  earthbit:
+    driver: bridge
+
 services:
   manager:
     build: ./manager
@@ -8,9 +13,18 @@ services:
       - USE_DHCLIENT=0
       - ELECTION_INTERVAL=10
       - ELECTION_K=1
-    network_mode: host
+    ports:
+      - "8888:8888"
+    networks:
+      - earthbit
     cap_add:
       - NET_ADMIN
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8888/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   worker1:
     build: ./worker
@@ -18,10 +32,17 @@ services:
     environment:
       - ROLE=worker
       - USE_DHCLIENT=0
-      - MANAGER_HOST=127.0.0.1
-      
+      - MANAGER_HOST=manager
+    networks:
+      - earthbit
     cap_add:
       - NET_ADMIN
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9999/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   worker2:
     build: ./worker
@@ -29,9 +50,16 @@ services:
     environment:
       - ROLE=worker
       - USE_DHCLIENT=0
-      - MANAGER_HOST=127.0.0.1
-
+      - MANAGER_HOST=manager
+    networks:
+      - earthbit
     cap_add:
       - NET_ADMIN
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9999/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 
