@@ -2,7 +2,9 @@ import asyncio
 import os
 import socket
 import logging
+import time
 from aiohttp import web, ClientSession, ClientTimeout
+from prometheus_client import CollectorRegistry, generate_latest, Gauge, Histogram, Counter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('worker')
@@ -23,7 +25,23 @@ async def task_handler(request):
     data = await request.json()
     logger.info('received task %s', data)
     # simulate work here; keep it idempotent and quick for WAN scenarios
-    return web.json_response({'status': 'done', 'echo': data})
+    # Support a simple sample task format: { "type": "http_call", "url": "http://...", "method": "POST", "body": {...} }
+    try:
+        ttype = data.get('type')
+        if ttype == 'http_call':
+            url = data.get('url')
+            method = data.get('method', 'POST').upper()
+            body = data.get('body', {})
+            timeout = ClientTimeout(total=10)
+            async with ClientSession() as sess:
+                async with sess.request(method, url, json=body, timeout=timeout) as resp:
+                    text = await resp.text()
+                    return web.json_response({'status': 'done', 'echo': data, 'target_status': resp.status, 'target_body': text})
+        else:
+            return web.json_response({'status': 'done', 'echo': data})
+    except Exception as e:
+        logger.exception('task execution failed')
+        return web.json_response({'status': 'error', 'error': str(e)}, status=500)
 
 
 def get_own_ip():
@@ -81,6 +99,12 @@ async def start_background(app):
     app['register_task'] = asyncio.create_task(register_periodically(app))
 
 
+# Prometheus metrics
+REGISTRY_METRICS = CollectorRegistry()
+PING_HIST = Histogram('worker_ping_latency_seconds', 'Latency of /ping handler', registry=REGISTRY_METRICS)
+TASKS_HANDLED = Counter('worker_tasks_handled_total', 'Total tasks handled by worker', registry=REGISTRY_METRICS)
+
+
 async def cleanup_background(app):
     app['register_task'].cancel()
     await app['session'].close()
@@ -90,8 +114,10 @@ def create_app():
     app = web.Application()
     app.add_routes([
         web.get('/', handle),
-        web.post('/task', task_handler),
-        web.get('/health', lambda request: web.json_response({'status': 'ok'})),
+    web.post('/task', task_handler),
+    web.get('/health', lambda request: web.json_response({'status': 'ok'})),
+    web.get('/ping', lambda request: web.json_response({'status': 'pong'})),
+    web.get('/metrics', lambda request: web.Response(body=generate_latest(REGISTRY_METRICS), content_type='text/plain; version=0.0.4')),
     ])
     app.on_startup.append(start_background)
     app.on_cleanup.append(cleanup_background)

@@ -1,3 +1,4 @@
 aiohttp>=3.8.0
 aiodns
+prometheus_client>=0.14.1
 

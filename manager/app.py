@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import random
+import time
 from aiohttp import web, ClientSession, ClientTimeout
+from prometheus_client import CollectorRegistry, generate_latest, Gauge, Histogram, Counter
 
 REGISTRY = {}
 PROXIES = []
@@ -28,6 +30,15 @@ async def register(request):
     REGISTRY[ip] = {"info": data, "last": now}
     # return the manager's view so worker can verify
     return web.json_response({"status": "ok", "ip": ip, "now": now})
+
+
+# Prometheus metrics
+REGISTRY_METRICS = CollectorRegistry()
+WORKER_LATENCY_GAUGE = Gauge('worker_latency_seconds', 'Last measured latency to worker (seconds)', ['worker_ip'], registry=REGISTRY_METRICS)
+DISPATCH_LATENCY_HIST = Histogram('dispatch_latency_seconds', 'Latency for dispatching tasks to workers', registry=REGISTRY_METRICS)
+DISPATCH_SUCCESS = Counter('dispatch_success_total', 'Count of successful dispatches', registry=REGISTRY_METRICS)
+DISPATCH_FAILURE = Counter('dispatch_failure_total', 'Count of failed dispatches', registry=REGISTRY_METRICS)
+TASKS_TOTAL = Counter('tasks_dispatched_total', 'Total tasks dispatched', registry=REGISTRY_METRICS)
 
 async def list_workers(request):
     return web.json_response(REGISTRY)
@@ -71,6 +82,7 @@ async def dispatch(request):
     session: ClientSession = request.app['session']
     tried = set()
     last_error = None
+    TASKS_TOTAL.inc()
     for attempt in range(DISPATCH_RETRIES):
         # pick next candidate skipping tried ones
         candidates = [p for p in available if p not in tried]
@@ -83,20 +95,26 @@ async def dispatch(request):
         backoff = DISPATCH_BACKOFF_BASE * (2 ** attempt)
         # jitter
         backoff = backoff * (0.8 + random.random() * 0.4)
+        start = time.time()
         try:
             async with session.post(url, json=data, timeout=timeout) as resp:
                 text = await resp.text()
+                latency = time.time() - start
+                DISPATCH_LATENCY_HIST.observe(latency)
                 if 200 <= resp.status < 300:
                     # success: clear failure record
                     PROXY_FAILS.pop(proxy_ip, None)
+                    DISPATCH_SUCCESS.inc()
                     return web.json_response({'proxy': proxy_ip, 'status': resp.status, 'body': text})
                 else:
                     last_error = f'status {resp.status}'
+                    DISPATCH_FAILURE.inc()
                     # treat as failure and record
                     fails, _ = PROXY_FAILS.get(proxy_ip, (0, 0))
                     PROXY_FAILS[proxy_ip] = (fails + 1, asyncio.get_event_loop().time())
         except Exception as e:
             last_error = str(e)
+            DISPATCH_FAILURE.inc()
             fails, _ = PROXY_FAILS.get(proxy_ip, (0, 0))
             PROXY_FAILS[proxy_ip] = (fails + 1, asyncio.get_event_loop().time())
         # wait before next attempt
@@ -115,6 +133,26 @@ async def elect_proxies():
         print(f"Elected proxies: {PROXIES}")
 
 
+async def ping_workers():
+    """Periodically ping known workers to measure latency and update metrics."""
+    while True:
+        await asyncio.sleep(max(1.0, ELECTION_INTERVAL / 2))
+        session = app_global['session']
+        for ip, meta in list(REGISTRY.items()):
+            try:
+                url = f'http://{ip}:{app_global.get("worker_port", 9999)}/ping'
+                start = time.time()
+                timeout = ClientTimeout(total=REQUEST_TIMEOUT)
+                async with session.get(url, timeout=timeout) as resp:
+                    await resp.text()
+                    latency = time.time() - start
+                    WORKER_LATENCY_GAUGE.labels(worker_ip=ip).set(latency)
+            except Exception:
+                # on failure, set a very high latency sentinel
+                WORKER_LATENCY_GAUGE.labels(worker_ip=ip).set(float('inf'))
+
+
+
 async def cleanup_stale_workers():
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL)
@@ -129,12 +167,17 @@ async def start_background(app):
     app['session'] = ClientSession()
     app['election_task'] = asyncio.create_task(elect_proxies())
     app['cleanup_task'] = asyncio.create_task(cleanup_stale_workers())
+    # expose app globally for background ping task
+    global app_global
+    app_global = app
+    app['ping_task'] = asyncio.create_task(ping_workers())
 
 
 async def cleanup_background(app):
     app['election_task'].cancel()
     app['cleanup_task'].cancel()
     await app['session'].close()
+    app['ping_task'].cancel()
 
 
 def create_app():
@@ -144,7 +187,10 @@ def create_app():
         web.get('/workers', list_workers),
         web.get('/proxies', list_proxies),
         web.post('/dispatch', dispatch),
-        web.get('/health', lambda request: web.json_response({'status': 'ok'})),
+    web.get('/health', lambda request: web.json_response({'status': 'ok'})),
+    web.get('/metrics', lambda request: web.Response(body=generate_latest(REGISTRY_METRICS), content_type='text/plain; version=0.0.4')),
+    # sample task: manager will call /send-sample to dispatch a probe task to workers
+    web.post('/send-sample', lambda request: web.json_response({'status': 'use /dispatch with task payload'})),
     ])
     # set default worker port, can be overridden by env
     try:
